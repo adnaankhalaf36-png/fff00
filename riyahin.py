@@ -31,6 +31,15 @@ def money(value, currency):
     return f"{number(value):,.2f} {currency}"
 
 
+def format_number_input(value):
+    try:
+        n = number(value)
+        # keep two decimals, use comma as thousands separator
+        return f"{n:,.2f}"
+    except Exception:
+        return value
+
+
 def init_db():
     connection = db()
     connection.executescript("""
@@ -57,17 +66,37 @@ def init_db():
             currency TEXT DEFAULT 'IQD', created TEXT NOT NULL
         );
     """)
-    # add missing columns safely
+
+    # ensure recipient column exists in customers
     try:
         connection.execute("ALTER TABLE customers ADD COLUMN recipient TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
 
-    for column, definition in (("customer_total", "REAL DEFAULT 0"), ("paid_before", "REAL DEFAULT 0"), ("remaining_after", "REAL DEFAULT 0"), ("next_due_date", "TEXT DEFAULT ''"), ("receipt_time", "TEXT DEFAULT ''")):
+    # ensure recipient + helper columns exist in payments
+    for column, definition in (("recipient", "TEXT DEFAULT ''"), ("customer_total", "REAL DEFAULT 0"), ("paid_before", "REAL DEFAULT 0"), ("remaining_after", "REAL DEFAULT 0"), ("next_due_date", "TEXT DEFAULT ''"), ("receipt_time", "TEXT DEFAULT ''")):
         try:
             connection.execute(f"ALTER TABLE payments ADD COLUMN {column} {definition}")
         except sqlite3.OperationalError:
             pass
+
+    # migrate customers table to remove 'company' column if it exists
+    cursor = connection.cursor()
+    cursor.execute("PRAGMA table_info(customers)")
+    cols = [r[1] for r in cursor.fetchall()]
+    if "company" in cols:
+        # build new table without company column but keeping recipient
+        cursor.execute("BEGIN")
+        try:
+            cursor.execute("CREATE TABLE IF NOT EXISTS customers_new (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT NOT NULL, total REAL DEFAULT 0, paid REAL DEFAULT 0, notes TEXT DEFAULT '', currency TEXT DEFAULT 'IQD', payment_type TEXT DEFAULT 'نقدي', down_payment REAL DEFAULT 0, months_count INTEGER DEFAULT 1, installment_amount REAL DEFAULT 0, due_date TEXT DEFAULT '', created TEXT NOT NULL, recipient TEXT DEFAULT '')")
+            # copy data, set recipient to existing recipient or empty
+            copy_cols = ", ".join([c for c in ("id","name","phone","total","paid","notes","currency","payment_type","down_payment","months_count","installment_amount","due_date","created")])
+            cursor.execute(f"INSERT INTO customers_new({copy_cols}, recipient) SELECT {copy_cols}, COALESCE(recipient, '') FROM customers")
+            cursor.execute("DROP TABLE customers")
+            cursor.execute("ALTER TABLE customers_new RENAME TO customers")
+            cursor.execute("COMMIT")
+        except Exception:
+            cursor.execute("ROLLBACK")
     connection.commit()
     connection.close()
 
@@ -226,9 +255,9 @@ class App(tk.Tk):
             if type_filter.get() != "الكل": query += " AND payment_type=?"; args.append(type_filter.get())
             for row in connection.execute(query + " ORDER BY id DESC", args):
                 remain = max(number(row["total"]) - number(row["paid"]), 0)
-                months = row["months_count"] or "-"
-                due = row["due_date"] or "-"
-                tree.insert("", "end", iid=row["id"], values=(row["name"], row["phone"], row["recipient"] or "-", row["payment_type"], money(row["total"], row["currency"]), money(row["paid"], row["currency"]), money(remain, row["currency"]), months, due, row["currency"]))
+                months = row.get("months_count") or "-"
+                due = row.get("due_date") or "-"
+                tree.insert("", "end", iid=row["id"], values=(row["name"], row["phone"], row.get("recipient") or "-", row["payment_type"], money(row["total"], row["currency"]), money(row["paid"], row["currency"]), money(remain, row["currency"]), months, due, row["currency"]))
             connection.close()
         name_filter.trace_add("write", load); type_filter.trace_add("write", load); load()
 
@@ -242,21 +271,123 @@ class App(tk.Tk):
         selected = tree.selection()
         if not selected: messagebox.showwarning("اختيار مطلوب", "حدد زبونًا أولًا.", parent=self); return
         connection = db(); row = connection.execute("SELECT * FROM customers WHERE id=?", (selected[0],)).fetchone(); connection.close()
-        win = tk.Toplevel(self); win.title("تعديل بيانات الزبون"); win.geometry("520x480"); win.configure(bg="white")
+        win = tk.Toplevel(self); win.title("تعديل بيانات الزبون"); win.geometry("520x520"); win.configure(bg="white")
         fields = {}
-        labels = (("name", "اسم الزبون", row["name"]), ("phone", "رقم الهاتف", row["phone"]), ("recipient", "المستلم", row.get("recipient", "") or ""), ("total", "المبلغ الكلي", row["total"]), ("paid", "المبلغ المسدد", row["paid"]))
-        for index, (key, label, value) in enumerate(labels):
-            tk.Label(win, text=label, bg="white", font=("Segoe UI", 10, "bold")).grid(row=index, column=1, padx=15, pady=10, sticky="e")
-            field = tk.Entry(win, width=32, justify="right"); field.insert(0, str(value or "")); field.grid(row=index, column=0, padx=15, pady=10); fields[key] = field
-        payment_type = ttk.Combobox(win, values=("نقدي", "اجل", "قسط"), state="readonly", width=26); payment_type.set(row["payment_type"]); payment_type.grid(row=5, column=0); tk.Label(win, text="نوع الدفع", bg="white").grid(row=5, column=1)
-        currency = ttk.Combobox(win, values=CURRENCIES, state="readonly", width=26); currency.set(row["currency"]); currency.grid(row=6, column=0); tk.Label(win, text="العملة", bg="white").grid(row=6, column=1)
+        # fields: name, phone, recipient, total, paid, remain(readonly), months, installment(readonly), payment_type, currency
+        tk.Label(win, text="اسم الزبون", bg="white", font=("Segoe UI", 10, "bold")).grid(row=0, column=1, padx=15, pady=10, sticky="e")
+        name_entry = tk.Entry(win, width=36, justify="right"); name_entry.insert(0, row["name"] or ""); name_entry.grid(row=0, column=0, padx=15, pady=10); fields["name"] = name_entry
+
+        tk.Label(win, text="رقم الهاتف", bg="white", font=("Segoe UI", 10, "bold")).grid(row=1, column=1, padx=15, pady=10, sticky="e")
+        phone_entry = tk.Entry(win, width=36, justify="right"); phone_entry.insert(0, row["phone"] or ""); phone_entry.grid(row=1, column=0, padx=15, pady=10); fields["phone"] = phone_entry
+
+        tk.Label(win, text="المستلم", bg="white", font=("Segoe UI", 10, "bold")).grid(row=2, column=1, padx=15, pady=10, sticky="e")
+        recipient_entry = tk.Entry(win, width=36, justify="right"); recipient_entry.insert(0, row.get("recipient", "") or ""); recipient_entry.grid(row=2, column=0, padx=15, pady=10); fields["recipient"] = recipient_entry
+
+        tk.Label(win, text="المبلغ الكلي", bg="white", font=("Segoe UI", 10, "bold")).grid(row=3, column=1, padx=15, pady=10, sticky="e")
+        total_entry = tk.Entry(win, width=36, justify="right"); total_entry.insert(0, str(row["total"] or "")); total_entry.grid(row=3, column=0, padx=15, pady=10); fields["total"] = total_entry
+
+        tk.Label(win, text="المدفوع", bg="white", font=("Segoe UI", 10, "bold")).grid(row=4, column=1, padx=15, pady=10, sticky="e")
+        paid_entry = tk.Entry(win, width=36, justify="right"); paid_entry.insert(0, str(row["paid"] or "")); paid_entry.grid(row=4, column=0, padx=15, pady=10); fields["paid"] = paid_entry
+
+        tk.Label(win, text="المتبقي", bg="white", font=("Segoe UI", 10, "bold")).grid(row=5, column=1, padx=15, pady=10, sticky="e")
+        remain_entry = tk.Entry(win, width=36, justify="right", state="readonly"); remain_entry.grid(row=5, column=0, padx=15, pady=10); fields["remain"] = remain_entry
+
+        tk.Label(win, text="عدد الأقساط", bg="white", font=("Segoe UI", 10, "bold")).grid(row=6, column=1, padx=15, pady=10, sticky="e")
+        months_entry = tk.Entry(win, width=36, justify="right"); months_entry.insert(0, str(row.get("months_count") or "")); months_entry.grid(row=6, column=0, padx=15, pady=10); fields["months"] = months_entry
+
+        tk.Label(win, text="قيمة القسط", bg="white", font=("Segoe UI", 10, "bold")).grid(row=7, column=1, padx=15, pady=10, sticky="e")
+        installment_entry = tk.Entry(win, width=36, justify="right", state="readonly"); installment_entry.grid(row=7, column=0, padx=15, pady=10); fields["installment"] = installment_entry
+
+        payment_type = ttk.Combobox(win, values=("نقدي", "اجل", "قسط"), state="readonly", width=34); payment_type.set(row["payment_type"]); payment_type.grid(row=8, column=0); tk.Label(win, text="نوع الدفع", bg="white").grid(row=8, column=1)
+
+        currency = ttk.Combobox(win, values=CURRENCIES, state="readonly", width=34); currency.set(row["currency"]); currency.grid(row=9, column=0); tk.Label(win, text="العملة", bg="white").grid(row=9, column=1)
+
+        # validate months numeric and numbers
+        def validate_months(P):
+            return P.isdigit() or P == ""
+        def validate_number_input(P):
+            # allow digits, comma, dot, and empty or minus not allowed
+            return P == "" or all(ch.isdigit() or ch in '.,' for ch in P)
+        vcmd_months = (win.register(validate_months), '%P')
+        vcmd_number = (win.register(validate_number_input), '%P')
+        months_entry.configure(validate='key', validatecommand=vcmd_months)
+        total_entry.configure(validate='key', validatecommand=vcmd_number)
+        paid_entry.configure(validate='key', validatecommand=vcmd_number)
+
+        def compute_remaining(*_):
+            t = number(fields["total"].get())
+            p = number(fields["paid"].get())
+            rem = max(t - p, 0)
+            fields["remain"].configure(state="normal")
+            fields["remain"].delete(0, tk.END)
+            fields["remain"].insert(0, format_number_input(rem))
+            fields["remain"].configure(state="readonly")
+            compute_installment()
+
+        def compute_installment(*_):
+            rem = number(fields["remain"].get())
+            months = int(fields["months"].get()) if fields["months"].get().strip().isdigit() else 0
+            inst = rem / months if months else 0
+            fields["installment"].configure(state="normal")
+            fields["installment"].delete(0, tk.END)
+            fields["installment"].insert(0, format_number_input(inst))
+            fields["installment"].configure(state="readonly")
+
+        def on_type_change(event=None):
+            t = payment_type.get()
+            if t == "نقدي":
+                fields["paid"].delete(0, tk.END); fields["paid"].insert(0, format_number_input(number(fields["total"].get()))); fields["paid"].configure(state="readonly")
+                fields["remain"].configure(state="normal"); fields["remain"].delete(0, tk.END); fields["remain"].insert(0, "0.00"); fields["remain"].configure(state="readonly")
+                months_entry.grid_remove(); installment_entry.grid_remove()
+            elif t == "اجل":
+                fields["paid"].configure(state="normal")
+                months_entry.grid_remove(); installment_entry.grid_remove()
+                compute_remaining()
+            else:  # قسط
+                fields["paid"].configure(state="normal")
+                months_entry.grid(); installment_entry.grid(); compute_remaining()
+
+        payment_type.bind("<<ComboboxSelected>>", on_type_change)
+        fields["total"].bind("<FocusOut>", lambda e: total_entry.delete(0, tk.END) or total_entry.insert(0, format_number_input(number(total_entry.get()))))
+        fields["paid"].bind("<FocusOut>", lambda e: paid_entry.delete(0, tk.END) or paid_entry.insert(0, format_number_input(number(paid_entry.get()))))
+        fields["total"].bind("<KeyRelease>", lambda e: compute_remaining())
+        fields["paid"].bind("<KeyRelease>", lambda e: compute_remaining())
+        fields["months"].bind("<KeyRelease>", lambda e: compute_installment())
+
+        # initial compute and visibility
+        on_type_change(); compute_remaining()
+
         def save():
-            total, paid = number(fields["total"].get()), number(fields["paid"].get())
-            if not fields["name"].get().strip() or total <= 0 or paid < 0 or paid > total:
-                messagebox.showwarning("بيانات غير صحيحة", "تأكد من الاسم والمبلغ المسدد.", parent=win); return
-            connection = db(); connection.execute("UPDATE customers SET name=?, phone=?, recipient=?, total=?, paid=?, payment_type=?, currency=? WHERE id=?", (fields["name"].get().strip(), fields["phone"].get().strip(), fields["recipient"].get().strip(), total, paid, payment_type.get(), currency.get(), row["id"]))
+            name = fields["name"].get().strip()
+            phone = fields["phone"].get().strip()
+            recipient = fields["recipient"].get().strip()
+            if not name or not phone:
+                messagebox.showwarning("بيانات ناقصة", "أدخل الاسم والهاتف.", parent=win); return
+            total = number(fields["total"].get())
+            if total <= 0:
+                messagebox.showwarning("بيانات غير صحيحة", "أدخل المبلغ الكلي أكبر من صفر.", parent=win); return
+            ptype = payment_type.get()
+            if ptype == "نقدي":
+                paid = total
+                months = 1
+                installment = 0
+            elif ptype == "اجل":
+                paid = number(fields["paid"].get())
+                months = 1
+                installment = 0
+            else:
+                paid = number(fields["paid"].get())
+                months = int(fields["months"].get()) if fields["months"].get().strip().isdigit() else 0
+                if months <= 0:
+                    messagebox.showwarning("بيانات غير صحيحة", "أدخل عدد أقساط صحيح (>0).", parent=win); return
+                remaining = max(total - paid, 0)
+                installment = remaining / months if months else remaining
+            connection = db()
+            connection.execute("UPDATE customers SET name=?, phone=?, recipient=?, total=?, paid=?, payment_type=?, currency=?, months_count=?, installment_amount=? WHERE id=?",
+                               (name, phone, recipient, total, paid, ptype, currency.get(), months, installment, row["id"]))
             connection.commit(); connection.close(); self.show_customers(); win.destroy()
-        ttk.Button(win, text="حفظ التعديل", style="Primary.TButton", command=save).grid(row=7, column=0, columnspan=2, pady=18)
+
+        ttk.Button(win, text="حفظ التعديل", style="Primary.TButton", command=save).grid(row=10, column=0, columnspan=2, pady=18)
 
     def names(self, table):
         connection = db(); rows = connection.execute(f"SELECT DISTINCT name FROM {table} WHERE name!='' ORDER BY name").fetchall(); connection.close(); return [row[0] for row in rows]
@@ -296,6 +427,17 @@ class App(tk.Tk):
         tk.Label(win, text="العملة", bg="white").grid(row=9, column=1, padx=16, pady=9, sticky="e")
         currency = ttk.Combobox(win, values=CURRENCIES, state="readonly", width=34); currency.set("IQD"); currency.grid(row=9, column=0); fields["currency"] = currency
 
+        # input validation: months must be integer and totals numeric
+        def validate_months(P):
+            return P.isdigit() or P == ""
+        def validate_number_input(P):
+            return P == "" or all(ch.isdigit() or ch in '.,' for ch in P)
+        vcmd = (win.register(validate_months), '%P')
+        vcmd_n = (win.register(validate_number_input), '%P')
+        months_entry.configure(validate='key', validatecommand=vcmd)
+        total_entry.configure(validate='key', validatecommand=vcmd_n)
+        paid_entry.configure(validate='key', validatecommand=vcmd_n)
+
         # helper functions to update dependent fields
         def compute_remaining(*_):
             t = number(fields["total"].get())
@@ -303,20 +445,20 @@ class App(tk.Tk):
             rem = max(t - p, 0)
             fields["remain"].configure(state="normal")
             fields["remain"].delete(0, tk.END)
-            fields["remain"].insert(0, str(rem))
-            fields["remain"].configure(state="normal")
+            fields["remain"].insert(0, format_number_input(rem))
+            fields["remain"].configure(state="readonly")
             compute_installment()
 
         def compute_installment(*_):
             rem = number(fields["remain"].get())
-            months = max(1, int(number(fields["months"].get()) or 1)) if fields["months"].get().strip() else 0
+            months = int(fields["months"].get()) if fields["months"].get().strip().isdigit() else 0
             if months:
                 inst = rem / months
             else:
                 inst = 0
             fields["installment"].configure(state="normal")
             fields["installment"].delete(0, tk.END)
-            fields["installment"].insert(0, str(round(inst, 2)))
+            fields["installment"].insert(0, format_number_input(inst))
             fields["installment"].configure(state="readonly")
 
         def on_type_change(event=None):
@@ -325,35 +467,37 @@ class App(tk.Tk):
                 # only total needed; set paid == total, hide months/installment
                 fields["paid"].configure(state="normal")
                 fields["paid"].delete(0, tk.END)
-                fields["paid"].insert(0, fields["total"].get())
+                fields["paid"].insert(0, format_number_input(number(fields["total"].get())))
                 fields["paid"].configure(state="readonly")
                 fields["remain"].configure(state="normal")
                 fields["remain"].delete(0, tk.END)
-                fields["remain"].insert(0, "0")
+                fields["remain"].insert(0, "0.00")
                 fields["remain"].configure(state="readonly")
-                fields["months"].configure(state="normal")
-                fields["months"].delete(0, tk.END)
-                fields["months"].configure(state="readonly")
-                compute_installment()
+                # hide months and installment
+                months_entry.grid_remove()
+                installment_entry.grid_remove()
             elif t == "اجل":
-                # show total, paid editable, remaining computed
+                # show total, paid editable, remaining computed, hide installments
                 fields["paid"].configure(state="normal")
-                fields["months"].configure(state="normal")
-                fields["months"].delete(0, tk.END)
-                fields["months"].configure(state="readonly")
+                months_entry.grid_remove()
+                installment_entry.grid_remove()
                 compute_remaining()
             else:  # قسط
-                # total, paid editable, months editable, installment computed
+                # total, paid editable, months editable, installment computed and shown
                 fields["paid"].configure(state="normal")
-                fields["months"].configure(state="normal")
+                months_entry.grid()
+                installment_entry.grid()
                 compute_remaining()
 
+        payment_type.bind("<<ComboboxSelected>>", on_type_change)
+        on_type_change()
+
         # bind changes
+        fields["total"].bind("<FocusOut>", lambda e: total_entry.delete(0, tk.END) or total_entry.insert(0, format_number_input(number(total_entry.get()))))
+        fields["paid"].bind("<FocusOut>", lambda e: paid_entry.delete(0, tk.END) or paid_entry.insert(0, format_number_input(number(paid_entry.get()))))
         fields["total"].bind("<KeyRelease>", lambda e: compute_remaining())
         fields["paid"].bind("<KeyRelease>", lambda e: compute_remaining())
         fields["months"].bind("<KeyRelease>", lambda e: compute_installment())
-        payment_type.bind("<<ComboboxSelected>>", on_type_change)
-        on_type_change()
 
         def save():
             name = fields["name"].get().strip()
@@ -375,7 +519,9 @@ class App(tk.Tk):
                 installment = 0
             else:  # قسط
                 paid = number(fields["paid"].get())
-                months = max(1, int(number(fields["months"].get()) or 1))
+                months = int(fields["months"].get()) if fields["months"].get().strip().isdigit() else 0
+                if months <= 0:
+                    messagebox.showwarning("بيانات غير صحيحة", "أدخل عدد أقساط صحيح (>0).", parent=win); return
                 remaining = max(total - paid, 0)
                 installment = remaining / months if months else remaining
             connection = db(); cur = connection.cursor()
@@ -385,7 +531,7 @@ class App(tk.Tk):
 
         ttk.Button(win, text="حفظ بيانات الزبون", style="Primary.TButton", command=save).grid(row=10, column=0, columnspan=2, pady=18)
 
-    # ... rest of class remains unchanged ...
+    # ... rest of class remains unchanged (payments, receipts, printing) ...
 
     def show_companies(self):
         self.clear_body("حركات الشركات"); self.title_block("حركات الشركات", "الإيداع رصيد لنا، والسحب مبلغ مستحق علينا للشركات")
@@ -402,8 +548,6 @@ class App(tk.Tk):
             for row in connection.execute(query + " ORDER BY id DESC", args): tree.insert("", "end", iid=row["id"], values=(row["created"], row["name"], row["trans_type"], money(row["due"], row["currency"]), money(row["paid"], row["currency"]), row["currency"], row["notes"]))
             connection.close()
         name_filter.trace_add("write", load); type_filter.trace_add("write", load); load()
-
-    # The rest of the methods (payments, receipts, printing, reports, etc.) remain as in the original file.
 
     def print_html(self,title,body,number_text=""):
         path=os.path.abspath("riyahin_print.html")
