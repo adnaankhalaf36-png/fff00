@@ -306,7 +306,7 @@ class App(tk.Tk):
         def validate_months(P):
             return P.isdigit() or P == ""
         def validate_number_input(P):
-            # allow digits, comma, dot, and empty or minus not allowed
+            # allow digits, comma, dot, and empty
             return P == "" or all(ch.isdigit() or ch in '.,' for ch in P)
         vcmd_months = (win.register(validate_months), '%P')
         vcmd_number = (win.register(validate_number_input), '%P')
@@ -338,14 +338,16 @@ class App(tk.Tk):
             if t == "نقدي":
                 fields["paid"].delete(0, tk.END); fields["paid"].insert(0, format_number_input(number(fields["total"].get()))); fields["paid"].configure(state="readonly")
                 fields["remain"].configure(state="normal"); fields["remain"].delete(0, tk.END); fields["remain"].insert(0, "0.00"); fields["remain"].configure(state="readonly")
-                months_entry.grid_remove(); installment_entry.grid_remove()
+                months_entry.configure(state='normal'); months_entry.delete(0, tk.END); months_entry.configure(state='readonly')
+                fields["installment"].configure(state="normal"); fields["installment"].delete(0, tk.END); fields["installment"].insert(0, "0.00"); fields["installment"].configure(state="readonly")
             elif t == "اجل":
                 fields["paid"].configure(state="normal")
-                months_entry.grid_remove(); installment_entry.grid_remove()
+                months_entry.configure(state='normal'); months_entry.delete(0, tk.END); months_entry.configure(state='readonly')
                 compute_remaining()
             else:  # قسط
                 fields["paid"].configure(state="normal")
-                months_entry.grid(); installment_entry.grid(); compute_remaining()
+                months_entry.configure(state='normal')
+                compute_remaining()
 
         payment_type.bind("<<ComboboxSelected>>", on_type_change)
         fields["total"].bind("<FocusOut>", lambda e: total_entry.delete(0, tk.END) or total_entry.insert(0, format_number_input(number(total_entry.get()))))
@@ -382,8 +384,8 @@ class App(tk.Tk):
                     messagebox.showwarning("بيانات غير صحيحة", "أدخل عدد أقساط صحيح (>0).", parent=win); return
                 remaining = max(total - paid, 0)
                 installment = remaining / months if months else remaining
-            connection = db()
-            connection.execute("UPDATE customers SET name=?, phone=?, recipient=?, total=?, paid=?, payment_type=?, currency=?, months_count=?, installment_amount=? WHERE id=?",
+            connection = db(); cur = connection.cursor()
+            connection.execute("UPDATE customers SET name=?, phone=?, recipient=?, total=?, paid=?, payment_type=?, currency=?, months_count=?, installment_amount=? WHERE id= ?",
                                (name, phone, recipient, total, paid, ptype, currency.get(), months, installment, row["id"]))
             connection.commit(); connection.close(); self.show_customers(); win.destroy()
 
